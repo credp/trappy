@@ -60,7 +60,7 @@ class SysTrace(GenericFTrace):
 
         self.trace_path = path
 
-        super(SysTrace, self).__init__(name, normalize_time, scope, events,
+        super(SysTrace, self).__init__(name, None, normalize_time, scope, events,
                                        window, abs_window)
 
         self._do_parse()

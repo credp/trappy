@@ -129,7 +129,10 @@ class Base(object):
         pat_array = re.compile(r"([A-Za-z0-9_]+)={([^}]+)}")
 
         ret = defaultdict(int)
-
+        
+        #print self.name
+        #print self.data_array
+        
         for line in self.data_array:
             while True:
                 match = re.search(pat_array, line)

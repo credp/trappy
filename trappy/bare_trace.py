@@ -133,6 +133,7 @@ class BareTrace(object):
         setattr(self, name, event)
 
     def finalize_objects(self):
+        #print "finalizing objects - {}".format(self)
         for trace_class in self.trace_classes:
             trace_class.tracer = self
             trace_class.create_dataframe()

@@ -19,11 +19,15 @@
 
 import itertools
 import os
+import sys
 import re
 import pandas as pd
+import multiprocessing
+import time
 
 from trappy.bare_trace import BareTrace
 from trappy.utils import listify
+from types import ListType
 
 class FTraceParseError(Exception):
     pass
@@ -62,9 +66,12 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
 
     dynamic_classes = {}
 
-    def __init__(self, name="", normalize_time=True, scope="all",
-                 events=[], window=(0, None), abs_window=(0, None)):
+    def __init__(self, name="", data=None, normalize_time=True, scope="all",
+                 events=[], window=(0, None), abs_window=(0, None),
+                 num_processes=1, block_len=10000):
         super(GenericFTrace, self).__init__(name)
+        self.multiprocess_count = num_processes
+        self.block_len = block_len
 
         self.class_definitions.update(self.dynamic_classes.items())
         self.__add_events(listify(events))
@@ -86,6 +93,8 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         self.normalize_time = normalize_time
         self.window = window
         self.abs_window = abs_window
+        self.input_data = data
+        self.requested_events = events
 
     @classmethod
     def register_parser(cls, cobject, scope):
@@ -127,7 +136,16 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                 del scope_classes[name]
 
     def _do_parse(self):
-        self.__parse_trace_file(self.trace_path)
+        should_finalize = True
+        if not self.input_data:
+            self.input_data = self.trace_path
+        else:
+            should_finalize = False
+        self.__parse_trace_data(self.input_data, self.window, self.abs_window)
+
+        if not should_finalize:
+            return
+
         self.finalize_objects()
 
         if self.normalize_time:
@@ -177,8 +195,10 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         actual_trace = itertools.dropwhile(self.trace_hasnt_started(), fin)
         actual_trace = itertools.takewhile(self.trace_hasnt_finished(),
                                            actual_trace)
-
+        
+        
         for line in actual_trace:
+            #print '.',
             if not contains_unique_word(line):
                 self.lines += 1
                 continue
@@ -215,6 +235,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             if (timestamp < self.window[0] + self.basetime) or \
                (timestamp < self.abs_window[0]):
                 self.lines += 1
+                #print "-",
                 continue
 
             if (self.window[1] and timestamp > self.window[1] + self.basetime) or \
@@ -226,6 +247,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
 
             trace_class.append_data(timestamp, comm, pid, cpu, self.lines, data_str)
             self.lines += 1
+            #print "+",
 
     def trace_hasnt_started(self):
         """Return a function that accepts a line and returns true if this line
@@ -243,7 +265,7 @@ is not part of the trace.
 
     def trace_hasnt_finished(self):
         """Return a function that accepts a line and returns true if this line
-is part of the trace.
+            is part of the trace.
 
         This function is called with each line of the file *after*
         trace_hasnt_started() returns True so the first line it sees
@@ -258,9 +280,7 @@ is part of the trace.
         """
         return lambda x: True
 
-    def __parse_trace_file(self, trace_file):
-        """parse the trace and create a pandas DataFrame"""
-
+    def __memoize_unique_words(self):
         # Memoize the unique words to speed up parsing the trace file
         cls_for_unique_word = {}
         for trace_name in self.class_definitions.iterkeys():
@@ -268,18 +288,263 @@ is part of the trace.
 
             unique_word = trace_class.unique_word
             cls_for_unique_word[unique_word] = trace_class
+        return cls_for_unique_word
 
+    def __receive_data_blob(self, df_blob):
+        trace_class_name, line_base, dataframe = df_blob
+        #print "got data for {} : {} : {}".format(trace_class_name, line_base, type(dataframe))
+        if isinstance(dataframe, tuple):
+            for t in self.trace_classes:
+                if t.name == trace_class_name:
+                    #print "matched name for arrays"
+                    ( time_array, line_array, comm_array, 
+                      pid_array, cpu_array, data_array )= dataframe
+                    before = len(t.time_array)
+                    t.time_array.extend(time_array)
+                    #print "{} had {} now has {}".format(t.name, before, len(t.time_array))
+                    t.line_array.extend(line_array)
+                    t.comm_array.extend(comm_array)
+                    t.pid_array.extend(pid_array)
+                    t.cpu_array.extend(cpu_array)
+                    t.data_array.extend(data_array)
+        else:
+            for t in self.trace_classes:
+                if t.name == trace_class_name:
+                    #print "matched name for dataframe"
+                    #print "\n{} =======".format(os.getpid())
+                    #print "data for class {} starting at {}".format(trace_class_name, line_base)
+                    #print "in: {}".format(dataframe.index)
+                    t.data_frame = pd.concat([t.data_frame, dataframe])
+                    #print "stored: {}".format(t.data_frame.index)
+                    #print "======\n"
+                    sys.stdout.flush()
+                    #print "{} now has {} rows".format(t.name, len(t.data_frame))
+
+    def __parse_trace_data(self, trace_data, window, abs_window):
+        """parse the trace and create a pandas DataFrame"""
+        
+        cls_for_unique_word = self.__memoize_unique_words()
         if len(cls_for_unique_word) == 0:
             return
 
+        # when we are multiprocessing, each obj is passed a tuple with an
+        # offset and data
         try:
-            with open(trace_file) as fin:
-                self.lines = 0
-                self.__populate_data(
-                    fin, cls_for_unique_word)
+            line_prefix, lines = trace_data
+            self.__parse_trace_file_impl(lines, cls_for_unique_word, window, abs_window, line_prefix)
+        except ValueError:
+            # single process, just do inline on file/list
+            if self.multiprocess_count <= 1:
+                self.__parse_trace_file_impl(trace_data, cls_for_unique_word, 
+                                             window, abs_window)
+            else:
+                self.__parse_trace_queue_impl(trace_data, cls_for_unique_word,
+                                              window, abs_window)
+
+    def __push_to_output_q(self, output_q):
+        #print ""
+        use_dataframes = True
+        returned_data = None
+        
+        if use_dataframes:
+            self.finalize_objects()
+        
+        for trace_class in self.trace_classes:
+            if use_dataframes:
+                if not trace_class.data_frame.empty:
+                    #print "sending dataframe for {}".format(trace_class.name)
+                    returned_data = trace_class.data_frame
+            else:
+                if len(trace_class.data_array) > 0:
+                    #print "sending arrays for {}".format(trace_class.name) 
+                    returned_data = ( trace_class.time_array,
+                                      trace_class.line_array,
+                                      trace_class.comm_array,
+                                      trace_class.pid_array,
+                                      trace_class.cpu_array,
+                                      trace_class.data_array )
+            if returned_data is not None:
+                item = (trace_class.name, self.line_offset, returned_data)
+                #print "{} Sending {} from line {}. {} events".format(os.getpid(), trace_class.name, self.line_offset, len(trace_class.data_frame))
+                output_q.put(item, True)
+                #print "item sent"
+        #print ""
+        sys.stdout.flush()
+
+    def __parse_trace_queue_impl(self, trace_data, cls_for_unique_word, window,
+                                 abs_window):
+
+        def __worker_process(input_q, output_q, cls_for_unique_word,
+                             window, abs_window, events):
+            _obj = None
+            fails = 0
+            max_fails = 10
+            while True:
+                #print "Parsing a new set of lines"
+                # use a new instance of the class for each blob we parse
+                try:
+                    #print "{} waiting".format(os.getpid())
+                    data = input_q.get(True, 0.1)
+                    fails = 0
+                    #print "{} parsing".format(os.getpid())
+                    sys.stdout.flush()
+                    if _obj:
+                        _obj.__parse_trace_data(data, window, abs_window)
+                    else:
+                        _obj = FTrace( data=data, events=events, window=window,
+                                   abs_window=abs_window, normalize_time=False)
+                    #print "{} parsing end".format(os.getpid())
+                    #print "Putting output on queue"
+                except Exception as e:
+                    #print "worker exception on get {}".format(e)
+                    fails += 1
+                    if fails > max_fails:
+                        if _obj:
+                            #print "{} sending data back".format(os.getpid())
+                            _obj.__push_to_output_q(output_q)
+                        output_q.put(("::worker_end: {}".format(os.getpid()), 0, ""), True)
+                        return
+                    else:
+                        pass
+
+        # create input and output queues
+        input_q = multiprocessing.Queue() 
+        output_q = multiprocessing.Queue()
+
+        # populate input q
+        try:
+            if type(trace_data) is not ListType:
+                lines = open(trace_data)
+            else:
+                # If we are passed a list, parse it all.
+                print "queue implementation passed data? "
+                lines = trace_data
         except FTraceParseError as e:
-            raise ValueError('Failed to parse ftrace file {}:\n{}'.format(
-                trace_file, str(e)))
+            raise ValueError('Failed to parse ftrace data {}:\n{}'.format(
+                trace_data, str(e)))
+
+        # queue 1000 lines in each block
+        block_len = self.block_len
+
+        processes = []
+        multiprocess_count = self.multiprocess_count
+        for _ in range(0, multiprocess_count):
+            p=multiprocessing.Process(target=__worker_process,
+                                                     args=(input_q, output_q,
+                                                     cls_for_unique_word,
+                                                     window, abs_window,
+                                                     self.requested_events))
+            p.daemon = True
+            p.start()
+            processes.append(p)
+
+        def __get_line_range(fin, start, end):
+            array=[]
+            for line in itertools.islice(fin, start, end):
+                array.append(line)
+            return array
+        
+        item = 0
+        data_to_send = True
+        overlap = 100
+        next_block_start = 0
+        while True:
+            #print "top of recv loop"
+            try:
+                if data_to_send:
+                    for _ in range(self.multiprocess_count * 16):
+                        send_lines = __get_line_range(lines, 0, block_len+overlap)
+                        if len(send_lines):
+                            # data is not exhausted yet
+                            #print "{} Sending lines {}-{}".format(os.getpid(), next_block_start, next_block_start + len(send_lines))
+                            sys.stdout.flush()
+                            input_q.put((next_block_start, send_lines), True)
+                            next_block_start += len(send_lines)
+                            if len(send_lines) > block_len:
+                                next_block_start -= overlap
+                        else:
+                            data_to_send = False
+                            break
+
+                df_blob = output_q.get(True, 0.1)
+                str = df_blob[0]
+                if str[:13] != "::worker_end:":
+                    #print "{} got df_blob for {} based on line {} which has {} entries".format(os.getpid(), df_blob[0], df_blob[1], len(df_blob[2]))
+                    sys.stdout.flush()
+                    item += 1
+                    #print "Received {} items".format(item)
+                    self.__receive_data_blob(df_blob)
+                    #print "recvd an item"
+                else:
+                    pid_dying = int(str[14:])
+                    #print "Expecting {} to die ({})".format(pid_dying, df_blob[0])
+                    for p in processes:
+                        if p.pid == pid_dying:
+                            p.join()
+            except Exception as e:
+                #print "exception in recv. {}".format(repr(e))
+                #print "output queue is {} long".format(output_q.qsize())
+                pass
+
+            #if not data_to_send:            
+                #print "checking for workers finishing ",
+            end = True
+            for p in processes:
+                if p.is_alive(): 
+                    #print '+',
+                    end = False
+                #else:
+                    #print '.',
+            #print ""
+            if end:
+                for p in processes:
+                    p.join()
+                if output_q.qsize() == 0:
+                    self.finalize_objects()
+                    if getattr(self, 'should_normalize_time', None):
+                        self.normalize_time()
+                    break
+            #else:
+            #    if not data_to_send:
+            #        print "sending an end signal"
+            #        input_q.put((-1,["",]))
+
+        sys.stdout.flush()
+        #print "\n\n\n\n\n{} Complete. Dataframe contents are:".format(os.getpid())
+        #for t in self.trace_classes:
+            #print "{} {}".format(os.getpid(), t)
+            #print "{} {} has {} rows".format(os.getpid(), t.name, len(t.data_frame))
+            #if t.name == "cpu_frequency":
+            #for v in t.data_frame.index.values:
+            #    print v
+        #print "end of dump"
+        sys.stdout.flush()
+
+
+    def __parse_trace_file_impl(self, trace_data, cls_for_unique_word,
+                                window, abs_window, first_line=0):
+        """trace_data is expected to be one of the following:
+           * a filename
+           * a list of trace data lines
+           
+           If a filename is supplied, we read the lines into a list
+           and then parse the list.
+        """
+        try:
+            if type(trace_data) is not ListType:
+                with open(trace_data) as fin:
+                    lines = fin.readlines()[first_line:]
+            else:
+                # If we are passed a list, parse it all.
+                lines = trace_data
+
+            self.line_offset = first_line
+            self.lines = first_line
+            self.__populate_data(lines, cls_for_unique_word)
+            #print "=",
+        except FTraceParseError as e:
+            raise ValueError('Failed to parse ftrace data {}:\n{}'.format(
+                trace_data, str(e)))
 
     # TODO: Move thermal specific functionality
 
@@ -495,10 +760,15 @@ class FTrace(GenericFTrace):
 
     """
 
-    def __init__(self, path=".", name="", normalize_time=True, scope="all",
-                 events=[], window=(0, None), abs_window=(0, None)):
-        super(FTrace, self).__init__(name, normalize_time, scope, events,
-                                     window, abs_window)
+    def __init__(self, path=".", name="", data=None, normalize_time=True, scope="all",
+                 events=[], window=(0, None), abs_window=(0, None), num_processes=1, block_len=10000):
+        self.trace_path = self.__process_path(path)
+        
+        if not data:
+            self.__populate_metadata()
+
+        super(FTrace, self).__init__(name, data, normalize_time, scope, events,
+                                     window, abs_window, num_processes, block_len)
         self.raw_events = []
         self.trace_path = self.__process_path(path)
         self.__populate_metadata()
