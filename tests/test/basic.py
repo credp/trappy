@@ -14,6 +14,7 @@
 #
 import trappy
 import re
+import time
 
 my_events = [
     "sched_switch",
@@ -30,9 +31,20 @@ my_events = [
     "cpu_capacity",
     "cpu_idle"
 ]
-trace=trappy.FTrace(events=my_events)
+print "Parsing starting"
+#start_time = time.time()
+#trace=trappy.FTrace(events=my_events, num_processes=1)
+#after_single_thread_time = time.time()
+trace=trappy.FTrace(events=my_events, num_processes=2, block_len=10000)
+#after_quad_thread_time = time.time()
+
+#print "Single thread parsing took {}s".format(after_single_thread_time - start_time)
+#print "Quad thread parsing took {}s".format(after_quad_thread_time - after_single_thread_time)
+
 
 print "\n\nPARSING DONE\n\nChecking..."
+
+exit()
 
 # build a dict of trace lines with their timestamps as keys
 SPECIAL_FIELDS_RE = re.compile(
@@ -80,7 +92,7 @@ for key in timestamps:
             print "found {} in unique words".format(l[i])
             idx = i
             break
-                
+
         if idx is not None:
             if l[idx] not in missing_traces:
                 missing_traces[l[idx]] = 0
