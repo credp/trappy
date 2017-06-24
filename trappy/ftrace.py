@@ -300,19 +300,15 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         # The data blob is always a tuple, but the 3rd value
         # can be either another tuple (arrays) or a dataframe
         trace_class_name, line_base, embedded_blob = data_blob
-        #print "got data for {} : {} : {}".format(trace_class_name, line_base, type(dataframe))
         if isinstance(embedded_blob, tuple):
             # Data was sent back as a collection of arrays in a tuple
             # unpack them and insert them into the object as if they had
             # come directly from a trace file.
             for t in self.trace_classes:
                 if t.name == trace_class_name:
-                    #print "matched name for arrays"
                     ( time_array, line_array, comm_array,
                       pid_array, cpu_array, data_array ) = embedded_blob
-                    #before = len(t.time_array)
                     t.time_array.extend(time_array)
-                    #print "{} had {} now has {}".format(t.name, before, len(t.time_array))
                     t.line_array.extend(line_array)
                     t.comm_array.extend(comm_array)
                     t.pid_array.extend(pid_array)
@@ -323,15 +319,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             # then assume the data is sent as a dataframe.
             for t in self.trace_classes:
                 if t.name == trace_class_name:
-                    #print "matched name for dataframe"
-                    #print "\n{} =======".format(os.getpid())
-                    #print "data for class {} starting at {}".format(trace_class_name, line_base)
-                    #print "in: {}".format(dataframe.index)
                     t.data_frame = pd.concat([t.data_frame, embedded_blob])
-                    #print "stored: {}".format(t.data_frame.index)
-                    #print "======\n"
-                    #sys.stdout.flush()
-                    #print "{} now has {} rows".format(t.name, len(t.data_frame))
 
     # this function is used in both single and multiprocess mode.
     # In single process mode, the trace_data member is a single value
@@ -369,7 +357,6 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
     # data onto the output queue, so that the dispatcher can get
     # it back.
     def __push_to_output_q(self, output_q):
-        #print ""
         # set use_dataframes=True to generate dataframes in the worker and send
         # set it False to skip generating dataframes and send arrays instead.
         use_dataframes = True
@@ -383,11 +370,9 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         for trace_class in self.trace_classes:
             if use_dataframes:
                 if not trace_class.data_frame.empty:
-                    #print "sending dataframe for {}".format(trace_class.name)
                     returned_data = trace_class.data_frame
             else:
                 if len(trace_class.data_array) > 0:
-                    #print "sending arrays for {}".format(trace_class.name)
                     returned_data = ( trace_class.time_array,
                                       trace_class.line_array,
                                       trace_class.comm_array,
@@ -400,13 +385,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             # If the trace class has no data, returned_data will be None.
             if returned_data is not None:
                 item = (trace_class.name, self.line_offset, returned_data)
-                #print "{} Sending {} from line {}. {} events".format(
-                #        os.getpid(), trace_class.name, self.line_offset,
-                #        len(trace_class.data_frame))
                 output_q.put(item, True)
-                #print "item sent"
-        #print ""
-        #sys.stdout.flush()
 
     # __parse_trace became two versions in the multiprocess version.
     # __parse_trace_queue_impl is the version which implements creating
@@ -430,27 +409,19 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             fails = 0
             max_fails = 10
             while True:
-                #print "Parsing a new set of lines"
                 # use a new instance of the class for each blob we parse
                 try:
-                    #print "{} waiting".format(os.getpid())
                     data = input_q.get(True, 0.1)
                     fails = 0
-                    #print "{} parsing".format(os.getpid())
-                    #sys.stdout.flush()
                     if _obj:
                         _obj.__parse_trace_data(data, window, abs_window)
                     else:
                         _obj = FTrace( data=data, events=events, window=window,
                                    abs_window=abs_window, normalize_time=False)
-                    #print "{} parsing end".format(os.getpid())
-                    #print "Putting output on queue"
                 except Exception as e:
-                    #print "worker exception on get {}".format(e)
                     fails += 1
                     if fails > max_fails:
                         if _obj:
-                            #print "{} sending data back".format(os.getpid())
                             _obj.__push_to_output_q(output_q)
                         output_q.put(("::worker_end: {}".format(os.getpid()), 0, ""), True)
                         return
@@ -518,7 +489,6 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         # next set we are going to send.
         next_block_start = 0
         while True:
-            #print "top of recv loop"
             try:
                 # first send some data. At the beginning, all the workers have been
                 # created and will only wait 1s(ish) before starting to die.
@@ -529,8 +499,6 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                         send_lines = __get_line_range(lines, 0, self.block_len+overlap)
                         if len(send_lines):
                             # data is not exhausted yet
-                            #print "{} Sending lines {}-{}".format(os.getpid(), next_block_start, next_block_start + len(send_lines))
-                            #sys.stdout.flush()
                             # This is a blocking put. If we have a queue length limit
                             # (say, to reduce memory use) then this will throttle.
                             input_q.put((next_block_start, send_lines), True)
@@ -555,40 +523,27 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                 str = df_blob[0]
                 if str[:13] != "::worker_end:":
                     # This is data to receive
-                    #print "{} got df_blob for {} based on line {} which has {} entries".format(os.getpid(), df_blob[0], df_blob[1], len(df_blob[2]))
-                    #sys.stdout.flush()
                     item += 1
-                    #print "Received {} items".format(item)
                     self.__receive_data_blob(df_blob)
-                    #print "recvd an item"
                 else:
                     # This is a signal that a worker decided there was nothing left to
                     # do. Lets join it so it can die in peace.
                     pid_dying = int(str[14:])
-                    #print "Expecting {} to die ({})".format(pid_dying, df_blob[0])
                     for p in processes:
                         if p.pid == pid_dying:
                             p.join()
             except Exception as e:
                 # something caused an exception. This is expected if the queues run dry
                 # or fill up, so carry on.
-                #print "exception in recv. {}".format(repr(e))
-                #print "output queue is {} long".format(output_q.qsize())
                 pass
 
-            #if not data_to_send:
-                #print "checking for workers finishing ",
             # an exception above is the only way we exit the dispatch/recv loop
             # lets try to figure out what happened.
             # If we have any still-living workers, we should go round again
             end = True
             for p in processes:
                 if p.is_alive():
-                    #print '+',
                     end = False
-                #else:
-                    #print '.',
-            #print ""
             if end:
                 # here we have no living workers, so we should turn our data
                 # into dataframes ready to use
@@ -609,19 +564,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             # this is debug, I used to send end signals to workers - might still go back to that
             #else:
             #    if not data_to_send:
-            #        print "sending an end signal"
             #        input_q.put((-1,["",]))
-
-        #sys.stdout.flush()
-        #print "\n\n\n\n\n{} Complete. Dataframe contents are:".format(os.getpid())
-        #for t in self.trace_classes:
-            #print "{} {}".format(os.getpid(), t)
-            #print "{} {} has {} rows".format(os.getpid(), t.name, len(t.data_frame))
-            #if t.name == "cpu_frequency":
-            #for v in t.data_frame.index.values:
-            #    print v
-        #print "end of dump"
-        #sys.stdout.flush()
 
     # __parse_trace became two versions in the multiprocess version.
     # __parse_trace_file_impl is used when we are parsing data from a file
@@ -651,7 +594,6 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             self.line_offset = first_line
             self.lines = first_line
             self.__populate_data(lines, cls_for_unique_word)
-            #print "=",
         except FTraceParseError as e:
             raise ValueError('Failed to parse ftrace data {}:\n{}'.format(
                 trace_data, str(e)))
