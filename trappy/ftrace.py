@@ -445,10 +445,6 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         # data_to_send is True while we haven't sent everything out
         data_to_send = True
         end_sent = False
-        # I was not convinced we don't lose a few lines here and there
-        # so I added this overlapping thing where I send some extra lines
-        # in each block except the last. I think it is unnecessary now.
-        overlap = 100
         # next_block_start is the line counter for the first line in the
         # next set we are going to send.
         next_block_start = 0
@@ -461,17 +457,13 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                     # the input data
                     for _ in range(self.multiprocess_count):
                         send_lines = FTraceMpStatic.get_line_range(lines, 0,
-                                                                   self.block_len +
-                                                                   overlap)
+                                                                   self.block_len)
                         if len(send_lines):
                             # data is not exhausted yet
                             # This is a blocking put. If we have a queue length limit
                             # (say, to reduce memory use) then this will throttle.
                             input_q.put((next_block_start, send_lines), True)
                             next_block_start += len(send_lines)
-                            # If we remove the overlap, this bit will need to go too.
-                            if len(send_lines) > self.block_len:
-                                next_block_start -= overlap
                         else:
                             # if we get a 0-length array or None back
                             # then we reached the end of the input
