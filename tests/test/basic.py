@@ -31,15 +31,18 @@ my_events = [
     "cpu_capacity",
     "cpu_idle"
 ]
-print "Parsing starting"
-#start_time = time.time()
-#trace=trappy.FTrace(events=my_events, num_processes=1)
-#after_single_thread_time = time.time()
-trace=trappy.FTrace(events=my_events, num_processes=2, block_len=10000)
-#after_quad_thread_time = time.time()
 
-#print "Single thread parsing took {}s".format(after_single_thread_time - start_time)
-#print "Quad thread parsing took {}s".format(after_quad_thread_time - after_single_thread_time)
+num_processes=16
+print "Parsing starting"
+start_time = time.time()
+trace=trappy.FTrace(events=my_events)
+after_single_thread_time = time.time()
+print "Single thread parsing took {}s".format(after_single_thread_time - start_time)
+print "Parsing with {} processes".format(num_processes)
+trace=trappy.FTrace(events=my_events, num_processes=num_processes, block_len=100000)
+after_multi_thread_time = time.time()
+
+print "{} process parsing took {}s".format(num_processes, after_multi_thread_time - after_single_thread_time)
 
 
 print "\n\nPARSING DONE\n\nChecking..."
