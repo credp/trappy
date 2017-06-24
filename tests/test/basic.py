@@ -59,50 +59,58 @@ timestamps = {}
 missing_traces = {}
 with open("trace.txt") as fin:
     lines = fin.readlines()
-for line in lines:
-    fields_match = SPECIAL_FIELDS_RE.match(line)
-    if not fields_match:
-        continue
-    timestamp = float(fields_match.group('timestamp'))
-    if not fields_match.group('us'):
-        timestamp /= 1e9
-    timestamps[timestamp] = [ line, None ]
+    for line in lines:
+        fields_match = SPECIAL_FIELDS_RE.match(line)
+        if not fields_match:
+            continue
+        timestamp = float(fields_match.group('timestamp'))
+        if not fields_match.group('us'):
+            timestamp /= 1e9
+        timestamps[timestamp] = [ line, None ]
 
 got_lines = 0
 unique_words = []
-for t in trace.trace_classes:
-    unique_words.append(t.unique_word)
-    df = t.data_frame
-    timestamps_in_df = df.index.values
-    got_lines += len(timestamps_in_df)
-    for t in timestamps_in_df:
-        timestamps[t][1] = 'seen'
+output_name = "missing_data.txt"
+with open(output_name,'w') as f:
+    for t in trace.trace_classes:
+        unique_words.append(t.unique_word)
+        df = t.data_frame
+        timestamps_in_df = df.index.values
+        got_lines += len(timestamps_in_df)
+        for t in timestamps_in_df:
+            timestamps[t][1] = 'seen'
 
-print unique_words
+    print >>f, unique_words
 
-print "\n"
-lost_lines = 0
-for key in timestamps:
-    line = timestamps[key][0]
-    seen = timestamps[key][1]
-    if not seen:
-        l = line.split()
-        print "{} not found ({})".format(key, l)
-        idx=None
-        for i in range(len(l)):
-            if l[i] not in unique_words:
-                continue
-            print "found {} in unique words".format(l[i])
-            idx = i
-            break
+    print >>f, "\n"
+    lost_lines = 0
+    for key in timestamps:
+        line = timestamps[key][0]
+        seen = timestamps[key][1]
+        if not seen:
+            l = line.split()
+            print >>f, "{} not found ({})".format(key, l)
+            idx=None
+            for i in range(len(l)):
+                if l[i] not in unique_words:
+                    continue
+                print >>f, "found {} in unique words".format(l[i])
+                idx = i
+                break
 
-        if idx is not None:
-            if l[idx] not in missing_traces:
-                missing_traces[l[idx]] = 0
-            missing_traces[l[idx]] += 1
-        lost_lines += 1
+            if idx is not None:
+                if l[idx] not in missing_traces:
+                    missing_traces[l[idx]] = 0
+                missing_traces[l[idx]] += 1
+            lost_lines += 1
 
 print "\n\nGot {} lines.".format(got_lines)
 print "Lost {} lines.".format(lost_lines)
+print "Missing trace lines sent to {}".format(output_name)
+print "Traces we asked for which are missing:"
+missing_requested = False
 for key in missing_traces:
     print "{} - {}".format(key, missing_traces[key])
+    missing_requested = True
+if not missing_requested:
+    print "None"
