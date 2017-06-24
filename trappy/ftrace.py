@@ -457,10 +457,12 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                 # first send some data. At the beginning, all the workers have been
                 # created and will only wait 1s(ish) before starting to die.
                 if data_to_send:
-                    # send out 16 blocks per worker each time until we have exhausted
+                    # send out 1 block per worker each time until we have exhausted
                     # the input data
                     for _ in range(self.multiprocess_count):
-                        send_lines = FTraceMpStatic.get_line_range(lines, 0, self.block_len+overlap)
+                        send_lines = FTraceMpStatic.get_line_range(lines, 0,
+                                                                   self.block_len +
+                                                                   overlap)
                         if len(send_lines):
                             # data is not exhausted yet
                             # This is a blocking put. If we have a queue length limit
@@ -494,23 +496,20 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                     item += 1
                     self.__receive_data_blob(df_blob)
                 else:
-                    # This is a signal that a worker decided there was nothing left to
-                    # do. Lets join it so it can die in peace.
+                    # This is a signal that a worker decided there was nothing
+                    # left to do. Lets join it so it can die in peace.
                     pid_dying = int(str[14:])
-                    for p in processes:
-                        if p.pid == pid_dying:
-                            p.join()
+                    p = next((x for x in processes if x.pid == pid_dying), None)
+                    p.join() # let it raise if we did not match pids
             except Queue.Empty:
                 pass
 
             # an exception above is the only way we exit the dispatch/recv loop
-            # lets try to figure out what happened.
-            # If we have any still-living workers, we should go round again
-            end = True
-            for p in processes:
-                if p.is_alive():
-                    end = False
-            if end:
+            # lets try to figure out what happened. We could well just have drained
+            # the output_q, so if we have any still-living workers, we should go
+            # round again
+            all_dead = next((False for x in processes if x.is_alive()), True)
+            if all_dead:
                 # here we have no living workers, so we should turn our data
                 # into dataframes ready to use
                 # first, allow all the children to go away cleanly
