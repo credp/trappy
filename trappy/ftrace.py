@@ -19,11 +19,10 @@
 
 import itertools
 import os
-import sys
 import re
 import pandas as pd
 import multiprocessing
-import time
+import Queue
 
 from trappy.bare_trace import BareTrace
 from trappy.utils import listify
@@ -142,7 +141,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             self.input_lines = self.trace_path
         else:
             should_finalize = False
-        self.__parse_trace_data(self.input_lines, self.window, self.abs_window)
+        self._parse_trace_data(self.input_lines, self.window, self.abs_window)
 
         if not should_finalize:
             return
@@ -291,6 +290,24 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             cls_for_unique_word[unique_word] = trace_class
         return cls_for_unique_word
 
+
+    def __receive_arrays(self, t, arrays):
+        # Data was sent back as a collection of arrays in a tuple
+        # unpack them and insert them into the object as if they had
+        # come directly from a trace file.
+        ( time_array, line_array, comm_array,
+          pid_array, cpu_array, data_array ) = arrays
+        t.time_array.extend(time_array)
+        t.line_array.extend(line_array)
+        t.comm_array.extend(comm_array)
+        t.pid_array.extend(pid_array)
+        t.cpu_array.extend(cpu_array)
+        t.data_array.extend(data_array)
+
+    def __receieve_dataframe(self, t, dataframe):
+        t.data_frame = pd.concat([t.data_frame, dataframe])
+
+
     # This function is called in the dispatcher process when multiprocessing.
     # It is responsible for getting a blob of data returned from a worker
     # and putting it into the dispatcher object as if it had been parsed locally.
@@ -301,133 +318,93 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         # can be either another tuple (arrays) or a dataframe
         trace_class_name, line_base, embedded_blob = data_blob
         if isinstance(embedded_blob, tuple):
-            # Data was sent back as a collection of arrays in a tuple
-            # unpack them and insert them into the object as if they had
-            # come directly from a trace file.
-            for t in self.trace_classes:
-                if t.name == trace_class_name:
-                    ( time_array, line_array, comm_array,
-                      pid_array, cpu_array, data_array ) = embedded_blob
-                    t.time_array.extend(time_array)
-                    t.line_array.extend(line_array)
-                    t.comm_array.extend(comm_array)
-                    t.pid_array.extend(pid_array)
-                    t.cpu_array.extend(cpu_array)
-                    t.data_array.extend(data_array)
+            fn = self.__receive_arrays
         else:
-            # There are only two formats, so if we get here
-            # then assume the data is sent as a dataframe.
-            for t in self.trace_classes:
-                if t.name == trace_class_name:
-                    t.data_frame = pd.concat([t.data_frame, embedded_blob])
+            fn = self.__receieve_dataframe
+        t = next((x for x in self.trace_classes if x.name == trace_class_name),
+                 None)
+        if t:
+            fn(t, embedded_blob)
 
     # this function is used in both single and multiprocess mode.
-    # In single process mode, the trace_data member is a single value
-    # which can be any iterable type. This method is the one which
-    # decides which implementation to use.
-    # When called in the dispatcher in multiprocess mode, trace_data is
-    # an iterable value rather than a tuple, and since we have
-    # self.multiprocess_count > 1, we send the data via
-    # self.__parse_trace_queue_impl.
-    # As data packets (arrays of trace data lines) arrive at the workers
-    # they are sent through this function as tuples consisting of the offset
+    # To parse in a single process, the following must happen:
+    #   Set self.multiprocess_count <= 1
+    #   Pass in a file name
+    # In theory you can also:
+    #   Set self.multiprocess to anything you like
+    #   Pass in a tuple like ( index_of_first_line, array_of_trace_lines )
+    # HOWEVER this mode is for worker process use and is untested for single
+    # process use.
+    #
+    # To start multiprocess parsing, trace_data is an iterable type AND
+    # self.multiprocess must be > 1. (i.e. we should either open a file
+    # and pass the handle in trace_data or we should create a stream pointing
+    # somewhere).
+    # While multiprocess parsing, the worker processes send data packets
+    # (arrays of trace data lines) through this function as tuples consisting
+    # of the offset
     # into the file together with the array of lines. These are parsed by
     # the file implementation.
-    def __parse_trace_data(self, trace_data, window, abs_window):
+    def _parse_trace_data(self, trace_data, window, abs_window):
         """parse the trace and create a pandas DataFrame"""
-
-        cls_for_unique_word = self.__memoize_unique_words()
-        if len(cls_for_unique_word) == 0:
-            return
-
-        # when we are multiprocessing, each obj is passed a tuple with an
-        # offset and data
         try:
+            # when we are multiprocessing, each obj is passed a tuple with an
+            # offset and data
             line_prefix, lines = trace_data
-            self.__parse_trace_file_impl(lines, cls_for_unique_word, window, abs_window, line_prefix)
+            self.__parse_trace_file_impl(lines, window, abs_window, line_prefix)
         except ValueError:
-            # single process, just do inline on file/list
-            if self.multiprocess_count <= 1:
-                self.__parse_trace_file_impl(trace_data, cls_for_unique_word,
-                                             window, abs_window)
+            if self.multiprocess_count > 1:
+                # start a multiprocess parsing operation
+                self.__parse_trace_queue_impl(trace_data, window, abs_window)
             else:
-                self.__parse_trace_queue_impl(trace_data, cls_for_unique_word,
-                                              window, abs_window)
+                # single process, just do inline on file/list
+                self.__parse_trace_file_impl(trace_data, window, abs_window)
+
+
+    def __push_dataframes(self, output_q):
+        for trace_class in self.trace_classes:
+            if not trace_class.data_frame.empty:
+                output_q.put((trace_class.name, self.line_offset,
+                              trace_class.data_frame), True)
+
+    def __push_arrays(self, output_q):
+        for trace_class in self.trace_classes:
+            if len(trace_class.data_array):
+                output_q.put((trace_class.name, self.line_offset,
+                              (trace_class.time_array,
+                               trace_class.line_array,
+                               trace_class.comm_array,
+                               trace_class.pid_array,
+                               trace_class.cpu_array,
+                               trace_class.data_array)),
+                             True)
+
     # this function is called by a worker to push it's parsed
     # data onto the output queue, so that the dispatcher can get
     # it back.
-    def __push_to_output_q(self, output_q):
+    def _push_to_output_q(self, output_q):
         # set use_dataframes=True to generate dataframes in the worker and send
         # set it False to skip generating dataframes and send arrays instead.
         use_dataframes = True
-        returned_data = None
 
         # If we are using dataframes, we need to generate them first.
         if use_dataframes:
             self.finalize_objects()
+            self.__push_dataframes(output_q)
+        else:
+            self.__push_arrays(output_q)
 
-        # Check each trace class for data and put it on the queue if there is any
-        for trace_class in self.trace_classes:
-            if use_dataframes:
-                if not trace_class.data_frame.empty:
-                    returned_data = trace_class.data_frame
-            else:
-                if len(trace_class.data_array) > 0:
-                    returned_data = ( trace_class.time_array,
-                                      trace_class.line_array,
-                                      trace_class.comm_array,
-                                      trace_class.pid_array,
-                                      trace_class.cpu_array,
-                                      trace_class.data_array )
-            # returned_data will be populated with either a dataframe or
-            # a tuple with all the arrays embedded in it depending upon
-            # configuration above.
-            # If the trace class has no data, returned_data will be None.
-            if returned_data is not None:
-                item = (trace_class.name, self.line_offset, returned_data)
-                output_q.put(item, True)
+    @staticmethod
+    def __end_worker_obj():
+        return ( -1, ["",] )
 
     # __parse_trace became two versions in the multiprocess version.
     # __parse_trace_queue_impl is the version which implements creating
     # worker processes and sending/receiving data from them all.
-    def __parse_trace_queue_impl(self, trace_data, cls_for_unique_word, window,
-                                 abs_window):
-
-        # __worker_process is the function which is called as main for the
-        # processes in the worker pool. It waits for input on input_q,
-        # sends it to be parsed, and then returns the parsed data on
-        # output_q. The lifecycle is:
-        # blocking read from input_q (0.1s timeout)
-        #  if read something, parse it immediately
-        #  if nothing is there, count the number of times the queue was empty
-        #  when we read something, reset the empty queue counter
-        #  If we get nothing enough times, send any objects we have so far
-        #  along with an end notification, then exit.
-        def __worker_process(input_q, output_q, cls_for_unique_word,
-                             window, abs_window, events):
-            _obj = None
-            fails = 0
-            max_fails = 10
-            while True:
-                # use a new instance of the class for each blob we parse
-                try:
-                    data = input_q.get(True, 0.1)
-                    fails = 0
-                    if _obj:
-                        _obj.__parse_trace_data(data, window, abs_window)
-                    else:
-                        _obj = FTrace( data=data, events=events, window=window,
-                                   abs_window=abs_window, normalize_time=False)
-                except Exception as e:
-                    fails += 1
-                    if fails > max_fails:
-                        if _obj:
-                            _obj.__push_to_output_q(output_q)
-                        output_q.put(("::worker_end: {}".format(os.getpid()), 0, ""), True)
-                        return
-                    else:
-                        pass
-
+    def __parse_trace_queue_impl(self, trace_data, window, abs_window):
+        cls_for_unique_word = self.__memoize_unique_words()
+        if len(cls_for_unique_word) == 0:
+            return
         # create input and output queues
         # (input and output always named from
         #  the perspective of the dispatcher)
@@ -452,11 +429,10 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
         # Store references in processes for later housekeeping
         processes = []
         for _ in range(0, self.multiprocess_count):
-            p=multiprocessing.Process(target=__worker_process,
-                                                     args=(input_q, output_q,
-                                                     cls_for_unique_word,
-                                                     window, abs_window,
-                                                     self.requested_events))
+            p=multiprocessing.Process( target = FTraceMpStatic.worker_process,
+                                        args=(input_q, output_q,
+                                        window, abs_window,
+                                        self.requested_events))
             # daemon allows child processes to be automatically
             # killed when the parent dies.
             p.daemon = True
@@ -464,23 +440,11 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
             p.start()
             processes.append(p)
 
-        # __get_line_range is a data collection utility, it maybe
-        # doesn't belong here. What it does is to take the iterable
-        # source and return the requested range of lines as an
-        # array. If we pass a file in, we need to use start=0 always
-        # as reading will increment the position. If we pass a bare
-        # array in (which we have not tried yet) then this might not
-        # work unless we set up a stream on the array or something
-        def __get_line_range(fin, start, end):
-            array=[]
-            for line in itertools.islice(fin, start, end):
-                array.append(line)
-            return array
-
         # item is a counter for dispatched items
         item = 0
         # data_to_send is True while we haven't sent everything out
         data_to_send = True
+        end_sent = False
         # I was not convinced we don't lose a few lines here and there
         # so I added this overlapping thing where I send some extra lines
         # in each block except the last. I think it is unnecessary now.
@@ -495,8 +459,8 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                 if data_to_send:
                     # send out 16 blocks per worker each time until we have exhausted
                     # the input data
-                    for _ in range(self.multiprocess_count * 16):
-                        send_lines = __get_line_range(lines, 0, self.block_len+overlap)
+                    for _ in range(self.multiprocess_count):
+                        send_lines = FTraceMpStatic.get_line_range(lines, 0, self.block_len+overlap)
                         if len(send_lines):
                             # data is not exhausted yet
                             # This is a blocking put. If we have a queue length limit
@@ -510,7 +474,11 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                             # if we get a 0-length array or None back
                             # then we reached the end of the input
                             data_to_send = False
-                            break
+                else:
+                    if not end_sent:
+                        for _ in range(self.multiprocess_count):
+                            input_q.put(self.__end_worker_obj(), True)
+                        end_send = True
                 # next, look for some data back from a worker.
                 # ideally, we will be reading from the file at the same time as the workers are
                 # parsing the data, in order to get maximum efficiency.
@@ -532,9 +500,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                     for p in processes:
                         if p.pid == pid_dying:
                             p.join()
-            except Exception as e:
-                # something caused an exception. This is expected if the queues run dry
-                # or fill up, so carry on.
+            except Queue.Empty:
                 pass
 
             # an exception above is the only way we exit the dispatch/recv loop
@@ -554,6 +520,9 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                     p.join()
                 # if there is nothing outstanding from the child processes
                 # we can go ahead and generate our own dataframes
+                # We can do multiprocess dance again here for all our trace
+                # classes which need transforming into dataframes, but that's
+                # not implemented yet.
                 if output_q.qsize() == 0:
                     self.finalize_objects()
                     # we may not have this attribute, depending on which
@@ -561,21 +530,15 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                     if getattr(self, 'should_normalize_time', None):
                         self.normalize_time()
                     break
-            # this is debug, I used to send end signals to workers - might still go back to that
-            #else:
-            #    if not data_to_send:
-            #        input_q.put((-1,["",]))
 
     # __parse_trace became two versions in the multiprocess version.
     # __parse_trace_file_impl is used when we are parsing data from a file
-    #   directly, and does the normal trace parsing we are used to.
-    # It can probably be changed to only get data via a filename and not
-    # via the list format. We should perhaps change this to expect an
-    # open stream instead of using a filename passed in as trace_data
-    # and then we'd be able to either use a pipe, or an array stream
-    # or even a pipe directly from trace-cmd report.
-    def __parse_trace_file_impl(self, trace_data, cls_for_unique_word,
-                                window, abs_window, first_line=0):
+    # directly, and does the normal trace parsing we are used to.
+    # We should perhaps change this to expect an open stream instead
+    # of using a filename passed in as trace_data and then we'd be able
+    # to use an array stream or even a pipe directly from trace-cmd report.
+    def __parse_trace_file_impl(self, trace_data, window, abs_window,
+                                first_line=0):
         """trace_data is expected to be one of the following:
            * a filename
            * a list of trace data lines
@@ -583,8 +546,13 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
            If a filename is supplied, we read the lines into a list
            and then parse the list.
         """
+        cls_for_unique_word = self.__memoize_unique_words()
+        if len(cls_for_unique_word) == 0:
+            return
         try:
             if type(trace_data) is not ListType:
+                # for a file, we throw away any lines earlier than
+                # first_line
                 with open(trace_data) as fin:
                     lines = fin.readlines()[first_line:]
             else:
@@ -750,6 +718,53 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
 
             dfr.plot(ax=this_ax)
             trappy.plot_utils.post_plot_setup(this_ax, title=this_title)
+
+class FTraceMpStatic:
+        # get_line_range is a data collection utility. What it does
+        # is to take the iterable source and return the requested range
+        # of lines as an array. If we pass a file in, we need to use
+        # start=0 always as reading will increment the position. If we
+        # pass a bare array in (which we have not tried yet) then this
+        # might not work unless we set up a stream on the array or something
+        @staticmethod
+        def get_line_range(fin, start, end):
+            array=[]
+            for line in itertools.islice(fin, start, end):
+                array.append(line)
+            return array
+
+        # worker_process is the function which is called as main for the
+        # processes in the worker pool. It waits for input on input_q,
+        # sends it to be parsed, and then returns the parsed data on
+        # output_q. The lifecycle is:
+        # blocking read from input_q (0.1s timeout)
+        #  if read something, parse it immediately
+        #  if nothing is there, go round again
+        #  Once we get a die command, send any objects we have so far
+        #  along with an end notification, then exit.
+        @staticmethod
+        def worker_process(input_q, output_q, window, abs_window, events):
+            _obj = None
+            while True:
+                # use a new instance of the class for each blob we parse
+                try:
+                    data = input_q.get(True, 0.1)
+                    if data[0] == -1:
+                        # this is an end command
+                        if _obj:
+                            _obj._push_to_output_q(output_q)
+                        output_q.put(("::worker_end: {}".format(os.getpid()), 0, ""), True)
+                        return
+                    if _obj:
+                        _obj._parse_trace_data(data, window, abs_window)
+                    else:
+                        _obj = FTrace( input_lines=data, events=events, window=window,
+                                   abs_window=abs_window, normalize_time=False)
+                except Queue.Empty:
+                    pass
+                except:
+                    raise
+
 
 class FTrace(GenericFTrace):
     """A wrapper class that initializes all the classes of a given run
