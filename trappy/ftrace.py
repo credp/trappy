@@ -138,11 +138,11 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
 
     def _do_parse(self):
         should_finalize = True
-        if not self.input_data:
-            self.input_data = self.trace_path
+        if not self.input_lines:
+            self.input_lines = self.trace_path
         else:
             should_finalize = False
-        self.__parse_trace_data(self.input_data, self.window, self.abs_window)
+        self.__parse_trace_data(self.input_lines, self.window, self.abs_window)
 
         if not should_finalize:
             return
