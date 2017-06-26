@@ -472,7 +472,7 @@ subclassed by FTrace (for parsing FTrace coming from trace-cmd) and SysTrace."""
                     if not end_sent:
                         for _ in range(self.multiprocess_count):
                             input_q.put(self.__end_worker_obj(), True)
-                        end_send = True
+                        end_sent = True
                 # next, look for some data back from a worker.
                 # ideally, we will be reading from the file at the same time as the workers are
                 # parsing the data, in order to get maximum efficiency.
